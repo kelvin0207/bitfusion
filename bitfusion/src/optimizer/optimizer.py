@@ -15,6 +15,7 @@ import numpy as np
 logger = logging.getLogger('{}.{}'.format(__name__, 'Optimizer'))
 logger.setLevel(logging.DEBUG)
 
+# 分块维度对权重、激活与输出的依赖
 tile_deps = {}
 tile_deps['B/b']   = {'act': True, 'wgt': False, 'out': True}
 tile_deps['OW/ow'] = {'act': True, 'wgt': False, 'out': True}
@@ -36,8 +37,11 @@ def get_stats_fast(conv_params, tiling, order_type, verbose=False):
     Returns cycles and memory accesses to DRAM, IBUF, OBUF, and WBUF
         TODOs: Without im2col, the calculation of weight and act size is inexact
     """
+    # Step1: 参数解析
+    # 解析卷积参数与硬件配置
     acc_obj, K, O, S, IC, OC, B, iprec, wprec, im2col, energy_cost = conv_params
 
+    # 解析分块策略，num_b是分组个数，b是每组b的大小
     num_b, b = tiling['B/b']
     num_ow, ow = tiling['OW/ow']
     num_oh, oh = tiling['OH/oh']
@@ -48,6 +52,7 @@ def get_stats_fast(conv_params, tiling, order_type, verbose=False):
     
     perf_factor = acc_obj.get_perf_factor(iprec, wprec)       
 
+    # 计算基础内存访问量（以比特为单位）read & write
     writes = {}
     reads = {}
 
@@ -76,6 +81,8 @@ def get_stats_fast(conv_params, tiling, order_type, verbose=False):
     writes['out'] = ow * oh * ceil_a_by_b(oc, acc_obj.M) * acc_obj.M * b * oprec
     reads['out'] = ow * oh * ceil_a_by_b(oc, acc_obj.M) * acc_obj.M * b * oprec
 
+    # Step2: 计算个缓冲区的读写量，并检查资源是否溢出检查
+    # 检查各缓冲区数据量是否超过 SRAM 容量的一半【双缓冲（Double Buffering）】
     # Skip if overutilizing resources
     # TODO check bytes/bits
     overflow = False
@@ -94,6 +101,7 @@ def get_stats_fast(conv_params, tiling, order_type, verbose=False):
             print('out overflow')
             print(b, ow, oh, ic, oc)
         overflow = True
+    # 溢出导致提前结束并返回
     if overflow:
         if verbose:
             print('Activation size: {} bytes'.format(writes['act']/8.))
@@ -118,16 +126,24 @@ def get_stats_fast(conv_params, tiling, order_type, verbose=False):
         logger.debug('\tTiling: {}'.format(tiling))
         logger.debug('\tReads : {}'.format(reads))
         logger.debug('\tWrites: {}'.format(writes))
+    
+    # Step3: 循环展开与内存访问优化
+    # 按循环顺序反向展开（从最内层循环开始）
+    # 从最内层循环开始，逐级扩大内存访问量（如外层循环每迭代一次，内层数据需重新加载）。
+    # 内存访问优化：通过 write_promote 和 read_promote 标记，
+    # 确保数据量不超过 SRAM 容量时进行复用，减少 DRAM 访问。
     for loop in reversed(order_type):
         num_tiles, tile_size = tiling[loop]
-        # promote all writes
+        # promote all writes 优化写操作
         for namespace in writes:
             # promote is true
             if write_promote[namespace]:
                 # If tile loop depends on the namespace index, make the read size larger
+                # 若该循环依赖当前命名空间，则扩大访问量
                 if tile_deps[loop][namespace]:
                     writes[namespace] *= num_tiles
                     # If tile size is larger than the SRAM, set promote to False
+                    # 若超过 SRAM 容量，取消后续优化
                     if writes[namespace] > acc_obj.sram[namespace]*8./2:
                         write_promote[namespace] = False
                     else:
@@ -135,7 +151,7 @@ def get_stats_fast(conv_params, tiling, order_type, verbose=False):
             else:
                 writes[namespace] *= num_tiles
 
-        # promote all reads
+        # promote all reads 类似写优化
         for namespace in reads:
             # promote is true
             if read_promote[namespace]:
@@ -201,8 +217,10 @@ def get_stats_fast(conv_params, tiling, order_type, verbose=False):
         ws_energy = (os_loop * is_loop) * (wprec    + ws_loop * (iprec + oprec))
 
     min_energy = min(is_energy, ws_energy, os_energy)
+    # 按照分块策略分块后需要计算的总次数
     num_tiles = num_b * num_ow * num_oh * num_ic * num_oc
 
+    # 选择最佳的数据流，并计算出读写总量，以便后续计算
     if is_energy == min_energy:
         if verbose:
             logger.debug('SRAM access order: Input Stationary')
@@ -228,22 +246,29 @@ def get_stats_fast(conv_params, tiling, order_type, verbose=False):
         stats.reads['wgt'] += num_tiles * (kw * kh * ic * oc) * wprec
 
     # TODO: update
+    # Step4: 根据上述的分块策略与读写策略，计算总周期数和能量消耗
+    # 总周期数 = 计算周期 + 内存停顿周期
     initial_dram_reads = 0
     final_dram_writes = 0
     for namespace in max_write_size:
         initial_dram_reads += max_write_size[namespace]
     for namespace in max_read_size:
         final_dram_writes += max_read_size[namespace]
+    # latency 是最开始和最后的访存时间，只需要加一次就行
     latency = acc_obj.get_mem_read_cycles('dram', initial_dram_reads) + \
             acc_obj.get_mem_write_cycles('dram', final_dram_writes)
 
+    # total 是一次完成的时间，
+    # middle 是使用双buffer流水起来之后的时间，
+    # 因此需要减去initial和final的
     total_dram_accesses = stats.reads['dram'] + stats.writes['dram']
     middle_dram_accesses = total_dram_accesses - initial_dram_reads - final_dram_writes
 
-
+    # acc_obj.get_compute_cycles()输入分块的配置，估算出每个块计算的时间，然后乘上分块个数就行
     compute_cycles = num_tiles * acc_obj.get_compute_cycles(ic, oc, ow, oh, b, kw, kh, iprec, wprec, im2col)
     memory_cycles_required = ceil_a_by_b(middle_dram_accesses, acc_obj.mem_if_width)
 
+    # 检查内存访问是否可以被计算掩盖
     memory_stalls = max(0, memory_cycles_required - compute_cycles) + latency
     stats.total_cycles = compute_cycles + memory_stalls
     stats.mem_stall_cycles = memory_stalls
@@ -257,14 +282,26 @@ def get_stats_fast(conv_params, tiling, order_type, verbose=False):
 
 def optimize_for_order(conv_params):
     # Generate permutations for the order
+
+    # Step1 定义循环维度（计算维度）并生成所有可能的循环顺序
+    # 每个元素代表一个需要拆分的计算维度，格式为 全局维度/分块子维度：
+    # B/b：批次维度（B 为总批次，b 为分块后的子批次）。
+    # OW/ow/OH/oh：输出特征图的宽度 / 高度维度（OW/OH 为总尺寸，ow/oh 为分块后的子尺寸）。
+    # IC/ic：输入通道维度（IC 为总输入通道，ic 为分块后的子通道）。
+    # OC/oc：输出通道维度（OC 为总输出通道，oc 为分块后的子通道）。
+
     loops = ['B/b', 'OW/ow', 'OH/oh', 'IC/ic', 'OC/oc']
-    order = set(permutations(loops))
+    order = set(permutations(loops)) # A55 = 120 种
 
     return_dict = {}
     acc_obj, K, O, S, IC, OC, B, iprec, wprec, im2col, energy_cost = conv_params
 
+    # Step 2: 绑定子函数，准备并行计算
+    # functools.partial：将 conv_params 固定为 _optimize_for_order 的第一个参数，
+    # 使该函数只需接收循环顺序（order 中的元素）即可执行。
     _bound_optimizer_method = functools.partial(_optimize_for_order, conv_params)
 
+    # Step3: 并行计算所有循环顺序的性能
     try:
         pool = Pool(cpu_count())
         results = pool.map_async(_bound_optimizer_method, order).get(10000)
@@ -275,6 +312,7 @@ def optimize_for_order(conv_params):
         #     _bound_optimizer_method(o)
         # exit()
 
+        # Step 4：筛选最优方案
         best_cycles = None
         best_energy = None
         min_cycles = min([x[-4] for x in results])
@@ -288,6 +326,7 @@ def optimize_for_order(conv_params):
                 best_energy = energy
                 best_tiling = tiling
                 best_order = order_type
+        # Step 5: 生成最优指令序列并返回
         return get_loop_instructions(conv_params, best_tiling, best_order), best_tiling, best_order
 
     except KeyboardInterrupt:
@@ -427,6 +466,7 @@ def _optimize_for_order(conv_params, order_type, verbose=False):
 
     # We do not tile the "K" dimension and compute an entire 2-D conv at a
     # time
+    # 分块大小 b/ow/ic/oc 均为 2^_b/2^_o 等（2 的幂次），适配硬件二进制地址设计。
     num_O_tiles = int(math.ceil(log2(O))) + 1
     num_IC_tiles = int(math.ceil(log2(IC))) + 1
 
@@ -442,20 +482,21 @@ def _optimize_for_order(conv_params, order_type, verbose=False):
     best_energy = None
     best_tiling = None
 
+    # 循环 1：批次（B）分块大小
     for _b in range(num_B_tiles):
         b = min(1 << _b, B)
         num_b = ceil_a_by_b(B, b)
-
+        # 循环 2：输出特征图宽度/高度（OW/OH）分块大小
         for _o in range(num_O_tiles):
             ow = min(1 << _o, O)
             oh = ow
             num_ow = ceil_a_by_b(O, ow)
             num_oh = ceil_a_by_b(O, oh)
-
+             # 循环 3：输入通道（IC）分块大小
             for _ic in range(num_IC_tiles):
                 ic = min(1 << _ic, IC)
                 num_ic = ceil_a_by_b(IC, ic)
-
+                # 循环 4：输出通道（OC）分块大小
                 for _oc in range(num_OC_tiles):
 
                     if im2col:
@@ -464,10 +505,10 @@ def _optimize_for_order(conv_params, order_type, verbose=False):
                         oc = min((1 << _oc) * acc_obj.M, OC)
 
                     num_oc = ceil_a_by_b(OC, oc)
-
+                    # 计算输入特征图的分块大小（由输出分块和卷积核尺寸决定）
                     iw = K + (ow - 1) * S
                     ih = K + (oh - 1) * S
-
+                    # 构建分块策略字典（tiling）
                     tiling = {}
                     tiling['B/b'] = (num_b, b)
                     tiling['OW/ow'] = (num_ow, ow)
@@ -475,11 +516,13 @@ def _optimize_for_order(conv_params, order_type, verbose=False):
                     tiling['IC/ic'] = (num_ic, ic)
                     tiling['OC/oc'] = (num_oc, oc)
 
+                    # 计算当前分块策略的性能，核心是 `get_stats_fast`函数
                     stats = get_stats_fast(conv_params, tiling, order_type, verbose=False)
 
                     if stats is None:
                         continue
-
+                    
+                    # 筛选最优
                     cycles = stats.total_cycles
                     energy = stats.get_energy(energy_cost)
                     mem_cycles = stats.mem_stall_cycles

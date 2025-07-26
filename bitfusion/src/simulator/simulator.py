@@ -414,6 +414,7 @@ class Simulator(object):
         B = batch_size
         I = (O - 1) * S + K
 
+        # Step1：确定分块（Tiling）维度的候选数量
         # We do not tile the "K" dimension and compute an entire 2-D conv at a
         # time
         num_O_tiles = int(math.ceil(log2(O))) + 1
@@ -429,7 +430,14 @@ class Simulator(object):
         best_instructions_dict = {}
         conv_params = self.accelerator, K, O, S, IC, OC, B, iprec, wprec, im2col, self.get_energy_cost()
 
+        # Step2： 优化分块（Tiling）与循环顺序（Ordering）
+        # 核心优化步骤，通过 exhaustive search（穷举搜索）寻找最优的：
+        # best_tiling：各维度的分块大小（如输入通道分块 T_IC、输出通道分块 T_OC 等），需适配硬件 SRAM 容量和 systolic 阵列尺寸。
+        # best_order：循环执行顺序（如 B→IC→OC→O→K），决定数据复用效率（如优先复用输入特征图还是权重，减少内存访问）。
+        # 优化目标是最小化总周期数，因为分块和顺序直接影响数据在 SRAM 中的复用率（复用率高则 DRAM 访问少，周期少）。
         best_instructions, best_tiling, best_order = optimize_for_order(conv_params)
+        
+        # Step3: 计算性能统计信息
         stats = get_stats_fast(conv_params, best_tiling, best_order, verbose=False)
 
         act_reads = stats.reads['act']

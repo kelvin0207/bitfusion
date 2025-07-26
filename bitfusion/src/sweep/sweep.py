@@ -65,6 +65,7 @@ class SimulatorSweep(object):
             list_batch = [1]
 
         data_line = []
+        # Step1 使用嵌套循环遍历所有参数组合
         for batch_size in list_batch:
             for n in list_n:
                 for m in list_m:
@@ -77,6 +78,7 @@ class SimulatorSweep(object):
                                 for ibuf in list_ibuf:
                                     for obuf in list_obuf:
                                         for bw in list_bw:
+                                            # Step2 动态修改模拟器配置
                                             sim_obj.accelerator.N = n
                                             sim_obj.accelerator.M = m
                                             sim_obj.accelerator.pmax = pmax
@@ -85,6 +87,7 @@ class SimulatorSweep(object):
                                             sim_obj.accelerator.sram['wgt'] = wbuf
                                             sim_obj.accelerator.sram['out'] = obuf
                                             sim_obj.accelerator.sram['act'] = ibuf
+                                            # Step3 使用lookup_pandas_dataframe检查当前参数组合是否已被模拟过
                                             for b in list_bench:
                                                 lookup_dict = {}
                                                 lookup_dict['N'] = n
@@ -98,14 +101,18 @@ class SimulatorSweep(object):
                                                 lookup_dict['IBUF Size (bits)'] = ibuf
                                                 lookup_dict['Batch size'] = batch_size
                                                 results = lookup_pandas_dataframe(self.sweep_df, lookup_dict)
+                                                # 拿神经网络的配置数据用来 benchmark
                                                 nn = benchmarks.get_bench_nn(b, WRPN=True)
                                                 if len(results) == 0:
+                                                    # 新的模拟，否则跳过
                                                     self.logger.info('Simulating Benchmark: {}'.format(b))
                                                     self.logger.info('N x M = {} x {}'.format(n, m))
                                                     self.logger.info('Max Precision (bits): {}'.format(pmax))
                                                     self.logger.info('Min Precision (bits): {}'.format(pmin))
                                                     self.logger.info('Batch size: {}'.format(batch_size))
                                                     self.logger.info('Bandwidth (bits/cycle): {}'.format(bw))
+                                                    # Step4 模拟结果统计
+                                                    # 通过get_bench_numbers中的sim_obj.get_cycles()得到周期数据
                                                     stats = benchmarks.get_bench_numbers(nn, sim_obj, batch_size)
                                                     for layer in stats:
                                                         cycles = stats[layer].total_cycles
@@ -145,8 +152,12 @@ def check_pandas_or_run(sim, dataframe, sim_sweep_csv, batch_size=1, config_file
     results = lookup_pandas_dataframe(dataframe, ld)
 
     if len(results) == 0:
+        # 未命中，需要模拟
+        # 创建SimulatorSweep对象，它负责批量运行模拟器
         sweep_obj = SimulatorSweep(sim_sweep_csv, config_file)
+        # 调用sweep方法执行模拟，传入当前模拟器对象和批量大小列表
         dataframe = sweep_obj.sweep(sim, list_batch=[batch_size])
+        # 将新的模拟结果保存到 CSV 文件
         dataframe.to_csv(sim_sweep_csv, index=False)
         return lookup_pandas_dataframe(dataframe, ld)
     else:
